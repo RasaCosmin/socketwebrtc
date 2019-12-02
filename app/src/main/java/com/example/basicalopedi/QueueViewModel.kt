@@ -1,11 +1,13 @@
 package com.example.basicalopedi
 
+import android.content.Context
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.basicalopedi.webrtc.CustomPeer
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
@@ -15,11 +17,23 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.webrtc.IceCandidate
 import org.webrtc.SessionDescription
+import org.webrtc.SurfaceViewRenderer
 import java.io.Serializable
 
 class QueueViewModel : ViewModel() {
     private val socketHandler: SocketHandler by lazy { SocketHandler() }
     lateinit var session: Session
+
+
+    private lateinit var context: Context
+
+    fun setContext(context: Context) {
+        this.context = context
+    }
+
+    lateinit var localVideoRender: SurfaceViewRenderer
+    lateinit var remoteVideoRender: SurfaceViewRenderer
+
 
     val move: LiveData<Boolean>
         get() = _move
@@ -28,23 +42,25 @@ class QueueViewModel : ViewModel() {
     val showNoInternet: LiveData<Boolean>
         get() = _showNoInternet
 
-    private val _showNoInternet = MutableLiveData(false)
+    private val _showNoInternet = MutableLiveData<Boolean>()
 
     private val activePresenters = ArrayList<Session>()
 
     private val myIds = ArrayList<String>()
+
+    private val peers = HashMap<String, CustomPeer>()
 
     fun connectToSocket() {
         attachRegEvents()
         socketHandler.connect()
     }
 
-    fun attachRegEvents() {
+    private fun attachRegEvents() {
         socketHandler.attachEvent("userRegistered", onUserRegistered)
         socketHandler.attachEvent(Socket.EVENT_CONNECT, onConnect)
     }
 
-    fun attachQEvents(){
+    private fun attachQEvents() {
         socketHandler.attachEvent("pickedUser", onPickedUser)
         socketHandler.attachEvent("userRegistered", onUserRegistered)
 
@@ -65,6 +81,8 @@ class QueueViewModel : ViewModel() {
         socketHandler.detachEvent("userRegistered")
 
         session = Gson().fromJson(it[0].toString(), Session::class.java)
+
+        attachQEvents()
     }
 
     private val onPickedUser = Emitter.Listener {
@@ -77,7 +95,7 @@ class QueueViewModel : ViewModel() {
     }
 
     private fun constructJoinData(): JoinData {
-        val user = JoinUser("")
+        val user = JoinUser("5da41c07ef30d600106d152c")
 
         val joinQueModel = JoinQueueModel(user)
 
@@ -121,7 +139,7 @@ class QueueViewModel : ViewModel() {
                         Session::class.java
                     )
 
-                     session = newSession
+                    session = newSession
 
                     myIds.add(newSession.id!!)
                     //socketHandler.emitMessage("activatePresenter", sessionLiveData.value)
@@ -139,7 +157,7 @@ class QueueViewModel : ViewModel() {
                     )
                 }
 
-                startVideoCall()
+                startVideoCall(session.id!!)
             }
         })
 
@@ -172,7 +190,7 @@ class QueueViewModel : ViewModel() {
             val sdpMid = candidate.getString("sdpMid")
             val sdpMLineIndex = candidate.getInt("sdpMLineIndex")
             val iceCandidate = IceCandidate(sdpMid, sdpMLineIndex, candidateStr)
-            rtcClient.addIceCandidate(id, iceCandidate)
+            peers[id]?.addRemoteIceCandidate(iceCandidate)
 
         })
         socketHandler.attachEvent("iceCandidateTest-iOS", Emitter.Listener {
@@ -188,9 +206,9 @@ class QueueViewModel : ViewModel() {
                 SessionDescription.Type.ANSWER,
                 sdpAnswer["sdpAnswer"].toString()
             )
+            val id = sdpAnswer.getString("id")
 
-
-            rtcClient.processSdpAnswer(sdpAnswer.getString("id"), sd)
+            peers[id]?.setRemoteDescription(sd)
         })
         socketHandler.attachEvent("deactivatePresenter-iOS", Emitter.Listener {
             Log.d("test", "deactivatePresenter-iOS ${it[0]}")
@@ -238,7 +256,7 @@ class QueueViewModel : ViewModel() {
 
         socketHandler.attachEvent("created", Emitter.Listener {
             Log.d("test", "created ${it[0]}")
-            viewModelScope.launch { startVideoCall() }
+            viewModelScope.launch { startVideoCall(session.id!!) }
         })
         socketHandler.attachEvent("user-list-iOS", Emitter.Listener {
             Log.d("test", "user-list-iOS ${it[0]}")
@@ -254,10 +272,14 @@ class QueueViewModel : ViewModel() {
 
             val peerSettings = JSONObject(it[0].toString())
 
-            setCameraParams(
+            /*setCameraParams(
                 peerSettings.getString("audio"),
                 peerSettings.getString("camera")
-            )
+            )*/
+
+            peers[session.id]?.setCamera()
+
+
             //mediaResourcesStatus(session.id!!)
             //socketHandler.emitMessage("updateUserStatus", session)
 
@@ -269,7 +291,7 @@ class QueueViewModel : ViewModel() {
         socketHandler.attachEvent(Socket.EVENT_CONNECT, Emitter.Listener {
             Log.d("test", "EVENT_CONNECT")
             emitJoin()
-            emitGetMessages()
+            //emitGetMessages()
         })
 
         socketHandler.attachEvent(Socket.EVENT_RECONNECT, Emitter.Listener {
@@ -281,7 +303,7 @@ class QueueViewModel : ViewModel() {
             }
 
             //rtcClient.closeLocalConnection(sessionLiveData.value!!.id!!)
-            rtcClient.closeConnection()
+            peers.forEach { (k, v) -> v.close() }
 
             /*remoteView.clearImage()
             remoteView.release()
@@ -293,7 +315,7 @@ class QueueViewModel : ViewModel() {
             Log.d("test", "EVENT_DISCONNECT")
             //rtcClient.closeLocalConnection(sessionLiveData.value!!.id!!)
             //rtcClient.closeConnection()
-            releaseRenderers()
+            //releaseRenderers()
 
             viewModelScope.launch {
                 _showNoInternet.value = true
@@ -302,7 +324,101 @@ class QueueViewModel : ViewModel() {
         })
     }
 
+     fun emitJoin() {
+        socketHandler.emitMessage("create or join", session)
+    }
 
+    private fun endCall() {
+        peers.forEach { (k, v) -> v.close() }
+        activePresenters.clear()
+        myIds.clear()
+
+        socketHandler.closeSocket()
+    }
+
+    private fun startVideoCall(connectionId: String) {
+        val peer = CustomPeer(context, object : SocketEvents {
+            override fun setLocalSDP(localSDP: SessionDescription) {
+                session.sdpOffer = localSDP.description
+
+                val event = if (activePresenters.isNotEmpty()) {
+                    "startPresenterWhenUsersExistInRoom"
+                } else {
+                    "startPresenter"
+                }
+                socketHandler.emitMessage(event, session)
+
+                if (activePresenters.isNotEmpty()) {
+                    connectToActivePresenters()
+                }
+
+            }
+
+            override fun onIceCandidate(iceCandidate: IceCandidate) {
+                val cand = Candidate(
+                    iceCandidate.sdp,
+                    iceCandidate.sdpMid,
+                    iceCandidate.sdpMLineIndex
+                )
+
+                val candidate =
+                    IceCandidateModel(cand, session.id, connectionId)
+
+                socketHandler.emitMessage("onIceCandidate", candidate)
+            }
+
+        }, localVideoRender, remoteVideoRender)
+
+        peer.initLocalRenderer()
+
+        peers[connectionId] = peer
+    }
+
+    private fun startViewer(connectionId: String) {
+
+        val peer = CustomPeer(context, object : SocketEvents {
+            override fun setLocalSDP(localSDP: SessionDescription) {
+                session.sdpOffer = localSDP.description
+                val viewer = Viewer(connectionId, session)
+                socketHandler.emitMessage("startViewer", viewer)
+
+            }
+
+            override fun onIceCandidate(iceCandidate: IceCandidate) {
+                val cand = Candidate(
+                    iceCandidate.sdp,
+                    iceCandidate.sdpMid,
+                    iceCandidate.sdpMLineIndex
+                )
+
+                val candidate =
+                    IceCandidateModel(cand, session.id, connectionId)
+
+                socketHandler.emitMessage("onIceCandidate", candidate)
+            }
+        }, localVideoRender, remoteVideoRender)
+        peer.initRemoteRenderer()
+
+        peers[connectionId] = peer
+    }
+
+    private fun connectToActivePresenters() {
+        viewModelScope.launch {
+            for (presenter in activePresenters) {
+                Log.d("RTCclient", "connectToActivePresenters ${presenter.id}")
+
+                if (!myIds.contains(presenter.id!!))
+
+                    startViewer(presenter.id)
+            }
+        }
+    }
+}
+
+interface SocketEvents {
+    fun setLocalSDP(localSDP: SessionDescription)
+
+    fun onIceCandidate(iceCandidate: IceCandidate)
 }
 
 data class JoinUser(
@@ -434,5 +550,37 @@ data class Session(
 data class UserAgent(
     val deviceModel: String = Build.MODEL,
     val os: String = "Android: ${Build.VERSION.RELEASE}"
-):Serializable
+) : Serializable
 
+data class IceCandidateModel(
+    @field:SerializedName("candidate")
+    val candidate: Candidate? = null,
+
+    @field:SerializedName("sender")
+    val sender: String? = null,
+
+    @field:SerializedName("presenter")
+    val presenter: String? = null,
+
+    @field:SerializedName("type")
+    val type: String? = "video"
+)
+
+data class Candidate(
+    @field:SerializedName("candidate")
+    val candidate: String? = null,
+
+    @field:SerializedName("sdpMid")
+    val sdpMid: String? = null,
+
+    @field:SerializedName("sdpMLineIndex")
+    val sdpMLineIndex: Int? = null
+)
+
+data class Viewer(
+    @field:SerializedName("presenterId")
+    var presenterId: String? = null,
+
+    @field:SerializedName("user")
+    var user: Session
+)
