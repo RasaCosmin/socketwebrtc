@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/nav_host"
+    app:startDestination="@id/queueFragment">
+
+    <fragment
+        android:id="@+id/queueFragment"
+        android:name="com.example.basicalopedi.QueueFragment"
+        android:label="queue_fragment"
+        tools:layout="@layout/queue_fragment" >
+        <action
+            android:id="@+id/action_queueFragment_to_callFragment"
+            app:destination="@id/callFragment" />
+    </fragment>
+    <fragment
+        android:id="@+id/callFragment"
+        android:name="com.example.basicalopedi.CallFragment"
+        android:label="call_fragment"
+        tools:layout="@layout/call_fragment" />
+</navigation>
